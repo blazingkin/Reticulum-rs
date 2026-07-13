@@ -518,6 +518,15 @@ impl Transport {
         self.link_in_event_tx.0.subscribe()
     }
 
+    pub async fn events_for_link(&self, link_id: LinkId) -> broadcast::Receiver<LinkEventData> {
+        if self.handler.lock().await.in_links.contains_key(&link_id) {
+            self.in_link_events()
+        } else {
+            self.out_link_events()
+        }
+    }
+
+
     pub fn received_data_events(&self) -> broadcast::Receiver<ReceivedData> {
         self.received_data_tx.subscribe()
     }
@@ -675,6 +684,10 @@ async fn handle_proof<'a>(
         }
     }
 
+    for link in handler.in_links.values() {
+        link.lock().await.handle_packet(packet, false);
+    }
+
     let maybe_packet = handler.link_table.handle_proof(packet);
 
     if let Some((packet, iface)) = maybe_packet {
@@ -753,7 +766,12 @@ async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandl
         for link in handler.out_links.values() {
             let mut link = link.lock().await;
             if link.id() == &packet.destination {
-                let _ = link.handle_packet(&handler.link_out_event_tx, packet, true);
+                let result = link.handle_packet(&handler.link_out_event_tx, packet, true);
+
+                if let LinkHandleResult::MessageReceived(Some(proof)) = result {
+                    handler.send_packet(proof).await;
+                }
+
                 local_out_link_handled = true;
                 data_handled = true;
             }
@@ -1095,19 +1113,17 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     if link.elapsed() > timer_config.out_link_restart {
                         link.restart();
                     }
-                } else {
-                    if link.elapsed() > timer_config.out_link_stale + timer_config.out_link_close {
-                        if let Some(packet) = link.teardown(&handler.link_out_event_tx).unwrap_or_else(|err| {
-                            log::error!(
-                                "tp({}): teardown stale out-link error: {err:?}",
-                                handler.config.name
-                            );
-                            None
-                        }) {
-                            handler.send_packet(packet).await
-                        }
-                        links_to_remove.push(*link_entry.0);
+                } else if link.elapsed() > timer_config.out_link_stale + timer_config.out_link_close {
+                    if let Some(packet) = link.teardown(&handler.link_out_event_tx).unwrap_or_else(|err| {
+                        log::error!(
+                            "tp({}): teardown stale out-link error: {err:?}",
+                            handler.config.name
+                        );
+                        None
+                    }) {
+                        handler.send_packet(packet).await
                     }
+                    links_to_remove.push(*link_entry.0);
                 }
             }
             LinkStatus::Pending if link.elapsed() > timer_config.out_link_repeat => {

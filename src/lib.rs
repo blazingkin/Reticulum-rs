@@ -140,5 +140,6 @@ extern crate alloc;
 
 pub use reticulum_core::*;
 
+pub mod channel;
 pub mod iface;
 pub mod transport;
