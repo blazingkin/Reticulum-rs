@@ -134,6 +134,10 @@ pub trait LinkEventSink: Clone + Send + Sync + 'static {
     fn send(&self, event: LinkEventData);
 }
 
+pub trait LinkPayloadSink: Clone + Send + Sync + 'static {
+    fn send(&self, payload: LinkPayload);
+}
+
 pub struct Link {
     id: LinkId,
     destination: DestinationDesc,
@@ -144,7 +148,6 @@ pub struct Link {
     request_time: Instant,
     rtt: Duration,
     proves_messages: bool,
-    channel_tx: Option<tokio::sync::broadcast::Sender<LinkPayload>>,
 }
 
 impl Link {
@@ -159,31 +162,11 @@ impl Link {
             request_time: Instant::now(),
             rtt: Duration::from_secs(0),
             proves_messages: false,
-            channel_tx: None,
         }
     }
 
     pub fn prove_messages(&mut self, setting: bool) {
         self.proves_messages = setting;
-    }
-
-    #[allow(unused)]  // This method is mocked out in the unit tests, so clippy
-                      // will complain about it being unused in the test build.
-    pub(crate) fn bind_to_channel(
-        &mut self
-    ) -> Result<tokio::sync::broadcast::Receiver<LinkPayload>, RnsError> {
-        if self.channel_tx.is_some() {
-            log::error!("link({}) cannot be bound to another channel", self.id());
-            return Err(RnsError::ChannelError);
-        }
-
-        let (tx, rx) = tokio::sync::broadcast::channel(16);
-        self.channel_tx = Some(tx);
-        self.prove_messages(true);
-
-        log::trace!("link({}) bound to channel", self.id());
-
-        Ok(rx)
     }
 
     pub fn new_from_request(
@@ -213,7 +196,6 @@ impl Link {
             request_time: Instant::now(),
             rtt: Duration::from_secs(0),
             proves_messages: false,
-            channel_tx: None,
         };
 
         link.handshake(peer_identity);
@@ -426,9 +408,10 @@ impl Link {
         &self.rtt
     }
 
-    fn handle_data_packet<E: LinkEventSink>(
+    fn handle_data_packet<E: LinkEventSink, P: LinkPayloadSink>(
         &mut self,
         event_tx: &E,
+        channel_tx: Option<&P>,
         packet: &Packet,
         out_link: bool
     ) -> LinkHandleResult {
@@ -500,13 +483,13 @@ impl Link {
                 }
             }
             PacketContext::Channel => {
-                if let Some(ref channel_tx) = self.channel_tx {
+                if let Some(channel_tx) = channel_tx {
                     let mut buffer = [0u8; PACKET_MDU];
                     if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer) {
                         log::trace!("link({}): data over channel {}B", self.id, plain_text.len());
                         self.request_time = Instant::now();
 
-                        channel_tx.send(LinkPayload::new_from_slice(plain_text)).ok();
+                        channel_tx.send(LinkPayload::new_from_slice(plain_text));
 
                         let payload = LinkPayload::new_from_slice(plain_text);
                         self.post_event(event_tx, LinkEvent::Data(Box::new(payload)));
@@ -554,7 +537,7 @@ impl Link {
         }
 
         if self.status == LinkStatus::Active && packet.context == PacketContext::None
-            && let Ok(hash) = validate_message_proof(&self.destination, packet.data.as_slice())
+            && let Ok(hash) = validate_message_proof(&self.peer_identity, packet.data.as_slice())
         {
             self.post_event(event_tx, LinkEvent::Proof(hash));
         }
@@ -566,9 +549,18 @@ impl Link {
 /// These methods are intended for use by Transport implementations
 pub trait LinkExt<E: LinkEventSink> {
     fn prove(&mut self, event_tx: &E) -> Packet;
-    fn handle_packet(&mut self, event_tx: &E, packet: &Packet, out_link: bool) -> LinkHandleResult;
     fn teardown(&mut self, event_tx: &E) -> Result<Option<Packet>, RnsError>;
     fn close(&mut self, event_tx: &E);
+}
+
+pub trait LinkExtHandlePacket<E: LinkEventSink, P: LinkPayloadSink> {
+    fn handle_packet(
+        &mut self,
+        event_tx: &E,
+        channel_tx: Option<&P>,
+        packet: &Packet,
+        out_link: bool
+    ) -> LinkHandleResult;
 }
 
 impl <E: LinkEventSink> LinkExt<E> for Link {
@@ -605,18 +597,6 @@ impl <E: LinkEventSink> LinkExt<E> for Link {
         }
     }
 
-    fn handle_packet(&mut self, event_tx: &E, packet: &Packet, out_link: bool) -> LinkHandleResult {
-        if packet.destination != self.id {
-            return LinkHandleResult::None;
-        }
-
-        match packet.header.packet_type {
-            PacketType::Data => self.handle_data_packet(event_tx, packet, out_link),
-            PacketType::Proof => self.handle_proof_packet(event_tx, packet),
-            _ => LinkHandleResult::None,
-        }
-    }
-
     fn teardown(&mut self, event_tx: &E) -> Result<Option<Packet>, RnsError> {
         let packet = if self.status != LinkStatus::Pending && self.status != LinkStatus::Closed {
             let mut packet = self.data_packet(self.id.as_slice())?;
@@ -633,6 +613,26 @@ impl <E: LinkEventSink> LinkExt<E> for Link {
         self.status = LinkStatus::Closed;
         self.post_event(event_tx, LinkEvent::Closed);
         log::warn!("link: close {}", self.id);
+    }
+}
+
+impl <E: LinkEventSink, P: LinkPayloadSink> LinkExtHandlePacket<E, P> for Link {
+    fn handle_packet(
+        &mut self,
+        event_tx: &E,
+        channel_tx: Option<&P>,
+        packet: &Packet,
+        out_link: bool
+    ) -> LinkHandleResult {
+        if packet.destination != self.id {
+            return LinkHandleResult::None;
+        }
+
+        match packet.header.packet_type {
+            PacketType::Data => self.handle_data_packet(event_tx, channel_tx, packet, out_link),
+            PacketType::Proof => self.handle_proof_packet(event_tx, packet),
+            _ => LinkHandleResult::None,
+        }
     }
 }
 
