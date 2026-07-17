@@ -7,8 +7,8 @@ use tokio::sync::{broadcast, Mutex, MutexGuard};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::destination::link::{Link, LinkEventData, LinkEventSink, LinkExt, LinkHandleResult,
-    LinkId, LinkStatus};
+use crate::destination::link::{Link, LinkEventData, LinkEventSink, LinkExt, LinkExtHandlePacket,
+    LinkHandleResult, LinkId, LinkPayload, LinkPayloadSink, LinkStatus};
 use crate::destination::{DestinationAnnounce, DestinationDesc, DestinationHandleStatus,
     DestinationName, SingleInputDestination, SingleOutputDestination};
 use crate::error::RnsError;
@@ -117,9 +117,25 @@ impl From<broadcast::Sender<LinkEventData>> for BroadcastLinkEventSink {
         Self(sender)
     }
 }
+
 impl LinkEventSink for BroadcastLinkEventSink {
     fn send(&self, event: LinkEventData) {
         let _ = self.0.send(event);
+    }
+}
+
+#[derive(Clone)]
+pub (crate) struct BroadcastLinkPayloadSink(broadcast::Sender<LinkPayload>);
+
+impl From<broadcast::Sender<LinkPayload>> for BroadcastLinkPayloadSink {
+    fn from(sender: broadcast::Sender<LinkPayload>) -> Self {
+        Self(sender)
+    }
+}
+
+impl LinkPayloadSink for BroadcastLinkPayloadSink {
+    fn send(&self, payload: LinkPayload) {
+        let _ = self.0.send(payload);
     }
 }
 
@@ -130,6 +146,7 @@ pub(crate) struct TransportHandler {
 
     path_table: PathTable,
     announce_table: AnnounceTable,
+    channel_table: HashMap<LinkId, BroadcastLinkPayloadSink>,
     link_table: LinkTable,
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
@@ -257,6 +274,7 @@ impl Transport {
             config,
             iface_manager: iface_manager.clone(),
             announce_table: AnnounceTable::new(),
+            channel_table: HashMap::new(),
             link_table: LinkTable::new(),
             path_table: PathTable::new(reroute_eager),
             single_in_destinations: HashMap::new(),
@@ -479,6 +497,15 @@ impl Transport {
         link
     }
 
+    #[allow(unused)]  // mocked out in the test build, so the linter
+                      // would complain about dead code
+    pub (crate) async fn bind_link_to_channel(
+        &self,
+        id: LinkId
+    ) -> Result<broadcast::Receiver<LinkPayload>, RnsError> {
+        self.handler.lock().await.bind_link_to_channel(id).await
+    }
+
     pub async fn link_close(&self, link_id: LinkId) -> Result<(), RnsError> {
         let link = if let Some(link) = self.find_in_link(&link_id).await {
             Some((link, &self.link_in_event_tx))
@@ -525,7 +552,6 @@ impl Transport {
             self.out_link_events()
         }
     }
-
 
     pub fn received_data_events(&self) -> broadcast::Receiver<ReceivedData> {
         self.received_data_tx.subscribe()
@@ -664,6 +690,20 @@ impl TransportHandler {
         })
         .await;
     }
+
+    async fn bind_link_to_channel(
+        &mut self,
+        id: LinkId
+    ) -> Result<broadcast::Receiver<LinkPayload>, RnsError> {
+        if self.channel_table.contains_key(&id) {
+            return Err(RnsError::ChannelError);
+        }
+
+        let (tx, rx) = broadcast::channel(16);
+        self.channel_table.insert(id, tx.into());
+
+        Ok(rx)
+    }
 }
 
 async fn handle_proof<'a>(
@@ -678,14 +718,29 @@ async fn handle_proof<'a>(
 
     for link in handler.out_links.values() {
         let mut link = link.lock().await;
-        if let LinkHandleResult::Activated = link.handle_packet(&handler.link_out_event_tx, packet, true) {
+        let link_id = *link.id();
+
+        if let LinkHandleResult::Activated = link.handle_packet(
+            &handler.link_out_event_tx,
+            handler.channel_table.get(&link_id),
+            packet,
+            true
+        ) {
             let rtt_packet = link.create_rtt();
             handler.send_packet(rtt_packet).await;
         }
     }
 
     for link in handler.in_links.values() {
-        link.lock().await.handle_packet(packet, false);
+        let mut link = link.lock().await;
+        let link_id = *link.id();
+
+        link.handle_packet(
+            &handler.link_in_event_tx,
+            handler.channel_table.get(&link_id),
+            packet,
+            false
+        );
     }
 
     let maybe_packet = handler.link_table.handle_proof(packet);
@@ -750,7 +805,15 @@ async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandl
 
         if let Some(link) = handler.in_links.get(&packet.destination).cloned() {
             let mut link = link.lock().await;
-            let result = link.handle_packet(&handler.link_in_event_tx, packet, false);
+            let channel_tx = handler.channel_table.get(link.id());
+
+            let result = link.handle_packet(
+                &handler.link_in_event_tx,
+                channel_tx,
+                packet,
+                false
+            );
+
             match result {
                 LinkHandleResult::KeepAlive => {
                     let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
@@ -765,8 +828,15 @@ async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandl
 
         for link in handler.out_links.values() {
             let mut link = link.lock().await;
-            if link.id() == &packet.destination {
-                let result = link.handle_packet(&handler.link_out_event_tx, packet, true);
+            let link_id = *link.id();
+
+            if link_id == packet.destination {
+                let result = link.handle_packet(
+                    &handler.link_out_event_tx,
+                    handler.channel_table.get(&link_id),
+                    packet,
+                    true
+                );
 
                 if let LinkHandleResult::MessageReceived(Some(proof)) = result {
                     handler.send_packet(proof).await;
