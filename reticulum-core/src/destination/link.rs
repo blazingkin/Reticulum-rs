@@ -120,6 +120,8 @@ pub enum LinkEvent {
     // LinkPayload >2000 bytes so we box it
     Data(Box<LinkPayload>),
     Proof(Hash),
+    // Identity 240 bytes
+    RemoteIdentified(Box<Identity>),
     Closed,
 }
 
@@ -143,6 +145,10 @@ pub struct Link {
     destination: DestinationDesc,
     priv_identity: PrivateIdentity,
     peer_identity: Identity,
+    /// For out-links (initiators), this will be set to the identity of the owner of the Link
+    /// destination after the handshake. For in-links, this will remain None unless the remote peer
+    /// identifies with `link.identify(identity)`
+    remote_identity: Option<Identity>,
     derived_key: DerivedKey,
     status: LinkStatus,
     request_time: Instant,
@@ -157,6 +163,7 @@ impl Link {
             destination,
             priv_identity: PrivateIdentity::new_from_rand(OsRng),
             peer_identity: Identity::default(),
+            remote_identity: None,
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
             request_time: Instant::now(),
@@ -191,6 +198,7 @@ impl Link {
             destination,
             priv_identity: PrivateIdentity::new(StaticSecret::random_from_rng(OsRng), signing_key),
             peer_identity,
+            remote_identity: None,
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
             request_time: Instant::now(),
@@ -261,6 +269,42 @@ impl Link {
         })
     }
 
+    /// Identifies the initiator of the link to the remote peer
+    pub fn identify(&self, identity: &PrivateIdentity) -> Result<Packet, RnsError> {
+        if self.status != LinkStatus::Active && self.status != LinkStatus::Stale {
+            log::warn!("link: can't create identity packet for closed link");
+            return Err(RnsError::LinkClosed)
+        }
+        let pub_identity = identity.as_identity();
+        let signed_data = [
+            self.id.as_slice(), pub_identity.public_key_bytes(), pub_identity.verifying_key_bytes()
+        ].concat();
+        let signature = identity.sign(&signed_data);
+        let proof_data = [
+            pub_identity.public_key_bytes(),
+            pub_identity.verifying_key_bytes(),
+            &signature.to_bytes()[..]
+        ].concat();
+        let mut data = PacketDataBuffer::new();
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(&proof_data, data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+        data.resize(cipher_text_len);
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context: PacketContext::LinkIdentify,
+            data
+        })
+    }
+
     pub fn keep_alive_packet(&self, data: u8) -> Packet {
         log::trace!("link({}): create keep alive {}", self.id, data);
 
@@ -316,6 +360,13 @@ impl Link {
 
     pub fn destination(&self) -> &DestinationDesc {
         &self.destination
+    }
+
+    /// For out-links (initiators), this is the identity of the 'Link' destination owner after it
+    /// has been verified and the 'Link' is 'Active'. For in-links, the remote identity is unknown
+    /// until the link initiator has identified using `link.identify(identity)`.
+    pub fn remote_identity(&self) -> Option<Identity> {
+        self.remote_identity
     }
 
     pub fn create_rtt(&self) -> Packet {
@@ -439,6 +490,47 @@ impl Link {
                     log::error!("link({}): can't decrypt packet", self.id);
                 }
             }
+            PacketContext::LinkIdentify => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!("link({}): link identify data {}B", self.id, plain_text.len());
+                    self.touch();
+                    if !out_link && plain_text.len() == PUBLIC_KEY_LENGTH * 2 + SIGNATURE_LENGTH {
+                        let public_key = &plain_text[..PUBLIC_KEY_LENGTH];
+                        let verifying_key = &plain_text[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH * 2];
+                        let signed_data = [self.id().as_slice(), public_key, verifying_key].concat();
+                        let signature = match Signature::from_slice(
+                            &plain_text[PUBLIC_KEY_LENGTH * 2..]
+                        ) {
+                            Ok(signature) => signature,
+                            Err(err) => {
+                                log::warn!(
+                                    "link({}): link identify packet invalid signature bytes: {err}",
+                                    self.id());
+                                return LinkHandleResult::None
+                            }
+                        };
+                        let identity = Identity::new_from_slices(public_key, verifying_key);
+                        match identity.verify(&signed_data, &signature) {
+                            Ok(()) => {
+                                if let Some(remote_id) = self.remote_identity.as_ref() {
+                                    log::debug!("link({}): link identity {} is valid but link is already identified as {}",
+                                        self.id(), identity.address_hash, remote_id.address_hash);
+                                } else {
+                                    log::debug!("link({}): link identified: {}",
+                                        self.id(), identity.address_hash);
+                                    self.remote_identity = Some(identity);
+                                    self.post_event(event_tx, LinkEvent::RemoteIdentified(Box::new(identity)));
+                                }
+                            }
+                            Err(err) => log::warn!(
+                                "link({}): identity verification failed: {err:?}", self.id())
+                        }
+                    }
+                } else {
+                    log::error!("link({}): can't decrypt link identify packet", self.id);
+                }
+            }
             PacketContext::KeepAlive => {
                 if !packet.data.is_empty() && packet.data.as_slice()[0] == 0xFF {
                     self.touch();
@@ -522,6 +614,7 @@ impl Link {
                 log::debug!("link({}): has been proved", self.id);
 
                 self.handshake(identity);
+                self.remote_identity = Some(self.destination.identity);
 
                 self.status = LinkStatus::Active;
                 self.rtt = self.request_time.elapsed();
