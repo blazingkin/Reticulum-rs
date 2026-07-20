@@ -699,17 +699,28 @@ async fn spawn_receiver<M: Message>(
     let incoming = inbound.get_incoming();
 
     tokio::spawn(async move {
+        let mut last_error_logged: Option<Instant> = None;
+
         loop {
             tokio::select!{
                 received = rx.recv() => {
                     match received {
                         Ok(payload) => inbound.receive(payload.as_slice()).await,
                         Err(err) => {
+                            if let Some(then) = last_error_logged {
+                                if then.elapsed() < Duration::from_secs(10) {
+                                    continue;
+                                }
+                            }
+
                             log::error!(
-                                "channel({}): error {} getting inbound message from link",
+                                "channel({}): error getting inbound message from link: {}",
                                 our_link_id,
                                 err
                             );
+
+                            last_error_logged = Some(Instant::now());
+
                             continue;
                         }
                     }
