@@ -7,6 +7,8 @@ use tokio::sync::{broadcast, Mutex, MutexGuard};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(not(test))]
+use crate::channel::{self, Channel};
 use crate::destination::link::{Link, LinkEventData, LinkEventSink, LinkExt, LinkExtHandlePacket,
     LinkHandleResult, LinkId, LinkPayload, LinkPayloadSink, LinkStatus};
 use crate::destination::{DestinationAnnounce, DestinationDesc, DestinationHandleStatus,
@@ -449,11 +451,11 @@ impl Transport {
     }
 
     pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
-        self.handler.lock().await.out_links.get(link_id).cloned()
+        self.handler.lock().await.find_out_link(link_id)
     }
 
     pub async fn find_in_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
-        self.handler.lock().await.in_links.get(link_id).cloned()
+        self.handler.lock().await.find_in_link(link_id)
     }
 
     pub async fn link(&self, destination: DestinationDesc) -> Arc<Mutex<Link>> {
@@ -497,6 +499,20 @@ impl Transport {
         link
     }
 
+    /// Consume `link` and wrap it in a new `Channel`.
+    ///
+    /// If successful, returns the new `Channel` and a receiver for
+    /// its incomigng messages.
+    ///
+    /// Fails if there is already a `Channel` wrapping `link`.
+    #[cfg(not(test))]
+    pub async fn mk_channel<M>(&self, link: Arc<Mutex<Link>>)
+        -> Result<(Channel<M>, broadcast::Receiver<M>), RnsError>
+    where M: channel::Message
+    {
+        Channel::new(self, link).await
+    }
+
     #[allow(unused)]  // mocked out in the test build, so the linter
                       // would complain about dead code
     pub (crate) async fn bind_link_to_channel(
@@ -507,21 +523,7 @@ impl Transport {
     }
 
     pub async fn link_close(&self, link_id: LinkId) -> Result<(), RnsError> {
-        let link = if let Some(link) = self.find_in_link(&link_id).await {
-            Some((link, &self.link_in_event_tx))
-        } else {
-            self.find_out_link(&link_id).await.map(|link| (link, &self.link_out_event_tx))
-        };
-        if let Some((link, event_tx)) = link {
-            let mut link = link.lock().await;
-            if let Some(packet) = link.teardown(event_tx)? {
-                drop(link);
-                self.send_packet(packet).await
-            }
-        } else {
-            log::warn!("tp({}): close link {link_id} not found", self.name)
-        }
-        Ok(())
+        self.handler.lock().await.link_close(link_id).await
     }
 
     pub async fn request_path(
@@ -610,10 +612,7 @@ impl Transport {
         self.handler.lock().await.knows_destination(address)
     }
 
-    #[allow(unused)]
-    // For testing purposes only. Since it is only used in unit tests, it
-    // would generate a warning when running cargo build.
-    fn get_handler(&self) -> Arc<Mutex<TransportHandler>> {
+    pub(crate) fn get_handler(&self) -> Arc<Mutex<TransportHandler>> {
         self.handler.clone()
     }
 }
@@ -625,7 +624,7 @@ impl Drop for Transport {
 }
 
 impl TransportHandler {
-    async fn send_packet(&self, packet: Packet) {
+    pub(crate) async fn send_packet(&self, packet: Packet) {
         let message = TxMessage {
             tx_type: TxMessageType::Broadcast(None),
             packet,
@@ -645,6 +644,32 @@ impl TransportHandler {
 
     fn knows_destination(&self, address: &AddressHash) -> bool {
         self.single_out_destinations.contains_key(address)
+    }
+
+    fn find_out_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
+        self.out_links.get(link_id).cloned()
+    }
+
+    fn find_in_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
+        self.in_links.get(link_id).cloned()
+    }
+
+    pub(crate) async fn link_close(&self, link_id: LinkId) -> Result<(), RnsError> {
+        let link = if let Some(link) = self.find_in_link(&link_id) {
+            Some((link, &self.link_in_event_tx))
+        } else {
+            self.find_out_link(&link_id).map(|link| (link, &self.link_out_event_tx))
+        };
+        if let Some((link, event_tx)) = link {
+            let mut link = link.lock().await;
+            if let Some(packet) = link.teardown(event_tx)? {
+                drop(link);
+                self.send_packet(packet).await
+            }
+        } else {
+            log::warn!("tp({}): close link {link_id} not found", self.config.name)
+        }
+        Ok(())
     }
 
     async fn filter_duplicate_packets(&self, packet: &Packet) -> bool {

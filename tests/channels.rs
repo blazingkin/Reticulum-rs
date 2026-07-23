@@ -1,7 +1,7 @@
-use std::sync::{Arc, Once};
+use std::sync::Once;
 use rand_core::OsRng;
 use reticulum::{
-    channel::{self, Channel},
+    channel,
     destination::DestinationName,
     destination::link::LinkEvent,
     error::RnsError,
@@ -9,7 +9,6 @@ use reticulum::{
     iface::udp::UdpInterface,
     transport::{Transport, TransportConfig},
 };
-use tokio::sync::Mutex;
 
 static INIT: Once = Once::new();
 
@@ -72,19 +71,17 @@ async fn channel_send() {
         id_a.clone(),
         DestinationName::new("test", "channels.send_multiple")).await;
     transport_a.send_announce(&dest, None).await;
-    let transport_a = Arc::new(Mutex::new(transport_a));
     let announce = recv_announces.recv().await.unwrap();
     // initiate the link from transport B and upgrade to channel
     let link = transport_b.link(announce.destination.lock().await.desc).await;
-    let transport_b = Arc::new(Mutex::new(transport_b));
-    let (_channel_endpoint_b, _receiver_b) = Channel::<ChannelMessage>::new(link, &transport_b)
-        .await.unwrap();
+    let (_channel_endpoint_b, _receiver_b) = transport_b.mk_channel::<ChannelMessage>(link).await
+        .unwrap();
     // wait for link activated event on transport A and upgrade to channel
     let event = in_link_events.recv().await.unwrap();
     let (channel_endpoint_a, _receiver_a) = match event.event {
         LinkEvent::Activated => {
-            let link = transport_a.lock().await.find_in_link(&event.id).await.unwrap();
-            Channel::<ChannelMessage>::new(link, &transport_a).await.unwrap()
+            let link = transport_a.find_in_link(&event.id).await.unwrap();
+            transport_a.mk_channel::<ChannelMessage>(link).await.unwrap()
         }
         _ => unreachable!()
     };

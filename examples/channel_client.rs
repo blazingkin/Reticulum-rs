@@ -1,8 +1,5 @@
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::time::Duration;
 
-use reticulum::channel::Channel;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::transport::{Transport, TransportConfig};
 
@@ -27,20 +24,14 @@ async fn main() {
     tokio::spawn(async move {
         let recv = transport.recv_announces();
         let mut recv = recv.await;
-        let arc_transport = Arc::new(Mutex::new(transport));
-
         let link = if let Ok(announce) = recv.recv().await {
-            arc_transport.lock().await.link(
-                announce.destination.lock().await.desc
-            ).await
+            transport.link(announce.destination.lock().await.desc).await
         } else {
             log::error!("Could not establish link, is the server running?");
             return;
         };
 
-        let (channel, _) = Channel::<ExampleMessage>::new(link, &arc_transport)
-            .await
-            .unwrap();
+        let (channel, _) = transport.mk_channel::<ExampleMessage>(link).await.unwrap();
         log::info!("channel created");
 
         let message = ExampleMessage::new_text("foo");
