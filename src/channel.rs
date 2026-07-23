@@ -105,10 +105,6 @@ async fn outlet_is_usable(link: &Arc<Mutex<Link>>) -> bool {
     // "issues looking at Link.status".
 }
 
-async fn outlet_timed_out(link: &Arc<Mutex<Link>>) {
-    link.lock().await.close();
-}
-
 /// Status of a message queried by `Channel::get_message_status`
 #[derive(Debug, PartialEq)]
 pub enum MessageStatus {
@@ -552,7 +548,14 @@ impl Outbound {
 
     async fn teardown(&mut self) {
         log::info!("channel({}): message timed out, tearing down channel", self.link_id);
-        outlet_timed_out(&self.outlet).await;
+
+        if let Some(transport) = self.transport.upgrade() {
+            let result = transport.lock().await.link_close(self.link_id).await;
+
+            if result.is_err() {
+                log::debug!("channel({}): error closing underlying link", self.link_id);
+            }
+        }
     }
 
     pub async fn send<M: Message>(&mut self, message: &M) -> Result<Hash, RnsError> {
@@ -696,17 +699,28 @@ async fn spawn_receiver<M: Message>(
     let incoming = inbound.get_incoming();
 
     tokio::spawn(async move {
+        let mut last_error_logged: Option<Instant> = None;
+
         loop {
             tokio::select!{
                 received = rx.recv() => {
                     match received {
                         Ok(payload) => inbound.receive(payload.as_slice()).await,
                         Err(err) => {
+                            if let Some(then) = last_error_logged {
+                                if then.elapsed() < Duration::from_secs(10) {
+                                    continue;
+                                }
+                            }
+
                             log::error!(
-                                "channel({}): error {} getting inbound message from link",
+                                "channel({}): error getting inbound message from link: {}",
                                 our_link_id,
                                 err
                             );
+
+                            last_error_logged = Some(Instant::now());
+
                             continue;
                         }
                     }
@@ -770,7 +784,7 @@ impl<M: Message> Channel<M> {
             me_rx
         ).await;
 
-        let rx = link.lock().await.bind_to_channel()?;
+        let rx = transport.lock().await.bind_link_to_channel(link_id).await?;
 
         let incoming = spawn_receiver(rx, link_id, cancel).await;
         let incoming_rx = incoming.subscribe();
@@ -820,6 +834,7 @@ impl<M: Message> Channel<M> {
 #[cfg(test)]
 mod mock {
     use alloc::sync::Arc;
+    use alloc::collections::BTreeMap;
 
     use rand_core::OsRng;
 
@@ -832,6 +847,7 @@ mod mock {
     use crate::error::RnsError;
     use crate::hash::{AddressHash, Hash};
     use crate::packet::{PacketContext, PacketDataBuffer};
+    use crate::transport::BroadcastLinkPayloadSink;
 
     #[derive(Clone, Copy)]
     pub struct Packet {
@@ -872,7 +888,6 @@ mod mock {
         pub rtt: Duration,
         pub status: LinkStatus,
         pub tx: broadcast::Sender<LinkPayload>,
-        pub bound: bool
     }
 
     impl Link {
@@ -880,7 +895,7 @@ mod mock {
             let id = LinkId::new_from_rand(OsRng);
             let rtt = Duration::from_millis(20);
             let tx = broadcast::Sender::new(16);
-            Self { id, rtt, status, tx, bound: false }
+            Self { id, rtt, status, tx }
         }
 
         pub fn rtt(&self) -> &Duration {
@@ -902,25 +917,16 @@ mod mock {
         pub fn close(&mut self) {
             self.status = LinkStatus::Closed;
         }
-
-        pub fn bind_to_channel(
-            &mut self
-        ) -> Result<broadcast::Receiver<LinkPayload>, RnsError> {
-            if self.bound {
-                return Err(RnsError::ChannelError);
-            }
-
-            self.bound = true;
-            Ok(self.tx.subscribe())
-        }
     }
 
     pub struct Transport {
         pub in_tx: broadcast::Sender<LinkEventData>,
         pub out_tx: broadcast::Sender<LinkEventData>,
-        packets: Arc<Mutex<Vec<Packet>>>
-        // the Arc<Mutex<...>> here is a hack so send_packet()
-        // does not neet a mutable reference to self
+        packets: Arc<Mutex<Vec<Packet>>>,
+        links: Arc<Mutex<BTreeMap<LinkId, Arc<Mutex<Link>>>>>,
+        channel_table: Arc<Mutex<BTreeMap<LinkId, BroadcastLinkPayloadSink>>>,
+        // the Arc<Mutex<...>> here is a hack so the mocked methods
+        // don't neet a mutable reference to self
     }
 
     impl Transport {
@@ -929,6 +935,8 @@ mod mock {
                 in_tx: broadcast::Sender::new(16),
                 out_tx: broadcast::Sender::new(16),
                 packets: Arc::new(Mutex::new(Vec::new())),
+                links: Arc::new(Mutex::new(BTreeMap::new())),
+                channel_table: Arc::new(Mutex::new(BTreeMap::new())),
             }
         }
 
@@ -945,6 +953,48 @@ mod mock {
         pub async fn packets(&self) -> Vec<Packet> {
             self.packets.lock().await.clone()
         }
+
+        pub async fn create_link(&self, status: LinkStatus) -> Arc<Mutex<Link>> {
+            let link = Link::new(status);
+            let link_id = *link.id();
+            let link = Arc::new(Mutex::new(link));
+
+            self.links.lock().await.insert(link_id, link.clone());
+
+            link
+        }
+
+        pub async fn bind_link_to_channel(
+            &self,
+            link_id: LinkId
+        ) -> Result<broadcast::Receiver<LinkPayload>, RnsError> {
+            let mut channels = self.channel_table.lock().await;
+
+            if channels.contains_key(&link_id) {
+                return Err(RnsError::ChannelError);
+            }
+
+            match self.links.lock().await.get(&link_id) {
+                Some(link) => {
+                    let tx = link.lock().await.tx.clone();
+                    let rx = tx.subscribe();
+
+                    channels.insert(link_id, tx.into());
+
+                    Ok(rx)
+                }
+                None => Err(RnsError::ChannelError)
+            }
+        }
+
+        pub async fn link_close(&self, link_id: LinkId) -> Result<(), RnsError> {
+            if let Some(link) = self.links.lock().await.get(&link_id) {
+                link.lock().await.close();
+            }
+
+            Ok(())
+        }
+
     }
 }
 
@@ -971,13 +1021,17 @@ mod tests {
     }
 
     impl Fixture {
-        pub fn new() -> Self {
-            Self {
-                link_a: Arc::new(Mutex::new(Link::new(LinkStatus::Active))),
-                link_b: Arc::new(Mutex::new(Link::new(LinkStatus::Active))),
-                transport_a: Arc::new(Mutex::new(Transport::new())),
-                transport_b: Arc::new(Mutex::new(Transport::new())),
-            }
+        pub async fn new() -> Self {
+            let transport_a = Transport::new();
+            let transport_b = Transport::new();
+
+            let link_a = transport_a.create_link(LinkStatus::Active).await;
+            let link_b = transport_b.create_link(LinkStatus::Active).await;
+
+            let transport_a = Arc::new(Mutex::new(transport_a));
+            let transport_b = Arc::new(Mutex::new(transport_b));
+
+            Self { link_a, link_b, transport_a, transport_b }
         }
     }
 
@@ -1019,7 +1073,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_message_delivery() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
 
         let (channel_a, _) = Channel::<TestMessage>::new(
             fixture.link_a.clone(),
@@ -1071,7 +1125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_message_failure() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
 
         let (channel_a, _) = Channel::<TestMessage>::new(
             fixture.link_a.clone(),
@@ -1102,7 +1156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_channel_not_ready() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         fixture.link_a.lock().await.status = LinkStatus::Pending;
 
         let (channel_a, _) = Channel::<TestMessage>::new(
@@ -1135,7 +1189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_ordering() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
 
         let (channel_a, _) = Channel::<TestMessage>::new(
             fixture.link_a.clone(),
@@ -1190,7 +1244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_message() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
 
         let (channel_a, _) = Channel::<TestMessage>::new(
             fixture.link_a.clone(),
@@ -1207,7 +1261,7 @@ mod tests {
 
         let packets = fixture.transport_a.lock().await.packets().await;
 
-        fixture.link_b.lock().await.tx.send(packets[1].payload()).unwrap();
+        fixture.link_b.lock().await.tx.send(packets[1].payload()).unwrap(); //
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 

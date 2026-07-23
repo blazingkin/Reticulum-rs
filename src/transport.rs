@@ -1,51 +1,21 @@
-use alloc::sync::Arc;
-use announce_limits::AnnounceLimits;
-use announce_table::AnnounceTable;
-use link_table::LinkTable;
-use packet_cache::PacketCache;
-use path_requests::create_path_request_destination;
-use path_requests::PathRequests;
-use path_requests::TagBytes;
-use path_table::PathTable;
-use rand_core::OsRng;
 use std::collections::HashMap;
 use std::time::Duration;
+
+use alloc::sync::Arc;
+use rand_core::OsRng;
+use tokio::sync::{broadcast, Mutex, MutexGuard};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use tokio::sync::broadcast;
-use tokio::sync::Mutex;
-use tokio::sync::MutexGuard;
-
-use crate::destination::link::Link;
-use crate::destination::link::LinkEventData;
-use crate::destination::link::LinkHandleResult;
-use crate::destination::link::LinkId;
-use crate::destination::link::LinkStatus;
-use crate::destination::DestinationAnnounce;
-use crate::destination::DestinationDesc;
-use crate::destination::DestinationHandleStatus;
-use crate::destination::DestinationName;
-use crate::destination::SingleInputDestination;
-use crate::destination::SingleOutputDestination;
-
+use crate::destination::link::{Link, LinkEventData, LinkEventSink, LinkExt, LinkExtHandlePacket,
+    LinkHandleResult, LinkId, LinkPayload, LinkPayloadSink, LinkStatus};
+use crate::destination::{DestinationAnnounce, DestinationDesc, DestinationHandleStatus,
+    DestinationName, SingleInputDestination, SingleOutputDestination};
 use crate::error::RnsError;
-
-use crate::hash::AddressHash;
-use crate::hash::Hash;
+use crate::hash::{AddressHash, Hash};
 use crate::identity::PrivateIdentity;
-
-use crate::iface::InterfaceManager;
-use crate::iface::InterfaceRxReceiver;
-use crate::iface::RxMessage;
-use crate::iface::TxMessage;
-use crate::iface::TxMessageType;
-
-use crate::packet::DestinationType;
-use crate::packet::Packet;
-use crate::packet::PacketContext;
-use crate::packet::PacketDataBuffer;
-use crate::packet::PacketType;
+use crate::iface::{InterfaceManager, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType};
+use crate::packet::{DestinationType, Packet, PacketContext, PacketDataBuffer, PacketType};
 
 mod announce_limits;
 mod announce_table;
@@ -53,6 +23,13 @@ mod link_table;
 mod packet_cache;
 mod path_requests;
 mod path_table;
+
+use self::announce_limits::AnnounceLimits;
+use self::announce_table::AnnounceTable;
+use self::link_table::LinkTable;
+use self::packet_cache::PacketCache;
+use self::path_requests::{create_path_request_destination, PathRequests, TagBytes};
+use self::path_table::PathTable;
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
@@ -133,6 +110,35 @@ pub struct AnnounceEvent {
     pub app_data: PacketDataBuffer,
 }
 
+#[derive(Clone)]
+struct BroadcastLinkEventSink(broadcast::Sender<LinkEventData>);
+impl From<broadcast::Sender<LinkEventData>> for BroadcastLinkEventSink {
+    fn from(sender: broadcast::Sender<LinkEventData>) -> Self {
+        Self(sender)
+    }
+}
+
+impl LinkEventSink for BroadcastLinkEventSink {
+    fn send(&self, event: LinkEventData) {
+        let _ = self.0.send(event);
+    }
+}
+
+#[derive(Clone)]
+pub (crate) struct BroadcastLinkPayloadSink(broadcast::Sender<LinkPayload>);
+
+impl From<broadcast::Sender<LinkPayload>> for BroadcastLinkPayloadSink {
+    fn from(sender: broadcast::Sender<LinkPayload>) -> Self {
+        Self(sender)
+    }
+}
+
+impl LinkPayloadSink for BroadcastLinkPayloadSink {
+    fn send(&self, payload: LinkPayload) {
+        let _ = self.0.send(payload);
+    }
+}
+
 pub(crate) struct TransportHandler {
     config: TransportConfig,
     iface_manager: Arc<Mutex<InterfaceManager>>,
@@ -140,6 +146,7 @@ pub(crate) struct TransportHandler {
 
     path_table: PathTable,
     announce_table: AnnounceTable,
+    channel_table: HashMap<LinkId, BroadcastLinkPayloadSink>,
     link_table: LinkTable,
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
@@ -153,7 +160,8 @@ pub(crate) struct TransportHandler {
 
     path_requests: PathRequests,
 
-    link_in_event_tx: broadcast::Sender<LinkEventData>,
+    link_in_event_tx: BroadcastLinkEventSink,
+    link_out_event_tx: BroadcastLinkEventSink,
     received_data_tx: broadcast::Sender<ReceivedData>,
 
     fixed_dest_path_requests: AddressHash,
@@ -163,8 +171,8 @@ pub(crate) struct TransportHandler {
 
 pub struct Transport {
     name: String,
-    link_in_event_tx: broadcast::Sender<LinkEventData>,
-    link_out_event_tx: broadcast::Sender<LinkEventData>,
+    link_in_event_tx: BroadcastLinkEventSink,
+    link_out_event_tx: BroadcastLinkEventSink,
     received_data_tx: broadcast::Sender<ReceivedData>,
     iface_messages_tx: broadcast::Sender<RxMessage>,
     handler: Arc<Mutex<TransportHandler>>,
@@ -266,6 +274,7 @@ impl Transport {
             config,
             iface_manager: iface_manager.clone(),
             announce_table: AnnounceTable::new(),
+            channel_table: HashMap::new(),
             link_table: LinkTable::new(),
             path_table: PathTable::new(reroute_eager),
             single_in_destinations: HashMap::new(),
@@ -276,7 +285,8 @@ impl Transport {
             packet_cache: Mutex::new(PacketCache::new()),
             path_requests,
             announce_tx,
-            link_in_event_tx: link_in_event_tx.clone(),
+            link_in_event_tx: link_in_event_tx.clone().into(),
+            link_out_event_tx: link_out_event_tx.clone().into(),
             received_data_tx: received_data_tx.clone(),
             fixed_dest_path_requests: path_request_dest,
             cancel: cancel.clone(),
@@ -294,8 +304,8 @@ impl Transport {
         Self {
             name,
             iface_manager,
-            link_in_event_tx,
-            link_out_event_tx,
+            link_in_event_tx: link_in_event_tx.into(),
+            link_out_event_tx: link_out_event_tx.into(),
             received_data_tx,
             iface_messages_tx,
             handler,
@@ -463,7 +473,7 @@ impl Transport {
             }
         }
 
-        let mut link = Link::new(destination, self.link_out_event_tx.clone());
+        let mut link = Link::new(destination);
 
         let packet = link.request();
 
@@ -487,15 +497,24 @@ impl Transport {
         link
     }
 
+    #[allow(unused)]  // mocked out in the test build, so the linter
+                      // would complain about dead code
+    pub (crate) async fn bind_link_to_channel(
+        &self,
+        id: LinkId
+    ) -> Result<broadcast::Receiver<LinkPayload>, RnsError> {
+        self.handler.lock().await.bind_link_to_channel(id).await
+    }
+
     pub async fn link_close(&self, link_id: LinkId) -> Result<(), RnsError> {
         let link = if let Some(link) = self.find_in_link(&link_id).await {
-            Some(link)
+            Some((link, &self.link_in_event_tx))
         } else {
-            self.find_out_link(&link_id).await
+            self.find_out_link(&link_id).await.map(|link| (link, &self.link_out_event_tx))
         };
-        if let Some(link) = link {
+        if let Some((link, event_tx)) = link {
             let mut link = link.lock().await;
-            if let Some(packet) = link.teardown()? {
+            if let Some(packet) = link.teardown(event_tx)? {
                 drop(link);
                 self.send_packet(packet).await
             }
@@ -519,11 +538,11 @@ impl Transport {
     }
 
     pub fn out_link_events(&self) -> broadcast::Receiver<LinkEventData> {
-        self.link_out_event_tx.subscribe()
+        self.link_out_event_tx.0.subscribe()
     }
 
     pub fn in_link_events(&self) -> broadcast::Receiver<LinkEventData> {
-        self.link_in_event_tx.subscribe()
+        self.link_in_event_tx.0.subscribe()
     }
 
     pub async fn events_for_link(&self, link_id: LinkId) -> broadcast::Receiver<LinkEventData> {
@@ -533,7 +552,6 @@ impl Transport {
             self.out_link_events()
         }
     }
-
 
     pub fn received_data_events(&self) -> broadcast::Receiver<ReceivedData> {
         self.received_data_tx.subscribe()
@@ -672,9 +690,26 @@ impl TransportHandler {
         })
         .await;
     }
+
+    async fn bind_link_to_channel(
+        &mut self,
+        id: LinkId
+    ) -> Result<broadcast::Receiver<LinkPayload>, RnsError> {
+        if self.channel_table.contains_key(&id) {
+            return Err(RnsError::ChannelError);
+        }
+
+        let (tx, rx) = broadcast::channel(16);
+        self.channel_table.insert(id, tx.into());
+
+        Ok(rx)
+    }
 }
 
-async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_proof<'a>(
+    packet: &Packet,
+    mut handler: MutexGuard<'a, TransportHandler>
+) {
     log::trace!(
         "tp({}): handle proof for {}",
         handler.config.name,
@@ -683,14 +718,29 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
 
     for link in handler.out_links.values() {
         let mut link = link.lock().await;
-        if let LinkHandleResult::Activated = link.handle_packet(packet, true) {
+        let link_id = *link.id();
+
+        if let LinkHandleResult::Activated = link.handle_packet(
+            &handler.link_out_event_tx,
+            handler.channel_table.get(&link_id),
+            packet,
+            true
+        ) {
             let rtt_packet = link.create_rtt();
             handler.send_packet(rtt_packet).await;
         }
     }
 
     for link in handler.in_links.values() {
-        link.lock().await.handle_packet(packet, false);
+        let mut link = link.lock().await;
+        let link_id = *link.id();
+
+        link.handle_packet(
+            &handler.link_in_event_tx,
+            handler.channel_table.get(&link_id),
+            packet,
+            false
+        );
     }
 
     let maybe_packet = handler.link_table.handle_proof(packet);
@@ -755,7 +805,15 @@ async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandl
 
         if let Some(link) = handler.in_links.get(&packet.destination).cloned() {
             let mut link = link.lock().await;
-            let result = link.handle_packet(packet, false);
+            let channel_tx = handler.channel_table.get(link.id());
+
+            let result = link.handle_packet(
+                &handler.link_in_event_tx,
+                channel_tx,
+                packet,
+                false
+            );
+
             match result {
                 LinkHandleResult::KeepAlive => {
                     let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
@@ -770,8 +828,15 @@ async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandl
 
         for link in handler.out_links.values() {
             let mut link = link.lock().await;
-            if link.id() == &packet.destination {
-                let result = link.handle_packet(packet, true);
+            let link_id = *link.id();
+
+            if link_id == packet.destination {
+                let result = link.handle_packet(
+                    &handler.link_out_event_tx,
+                    handler.channel_table.get(&link_id),
+                    packet,
+                    true
+                );
 
                 if let LinkHandleResult::MessageReceived(Some(proof)) = result {
                     handler.send_packet(proof).await;
@@ -1003,11 +1068,10 @@ async fn handle_link_request_as_destination<'a>(
                     packet,
                     destination.sign_key().clone(),
                     destination.desc,
-                    handler.link_in_event_tx.clone(),
                 );
 
                 if let Ok(mut link) = link {
-                    handler.send_packet(link.prove()).await;
+                    handler.send_packet(link.prove(&handler.link_in_event_tx)).await;
 
                     log::debug!(
                         "tp({}): save input link {} for destination {}",
@@ -1089,7 +1153,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                 link.stale();
             }
             LinkStatus::Stale if link.elapsed() > timer_config.in_link_stale + timer_config.in_link_close => {
-                if let Some(packet) = link.teardown().unwrap_or_else(|err| {
+                if let Some(packet) = link.teardown(&handler.link_in_event_tx).unwrap_or_else(|err| {
                     log::error!("tp({}): teardown stale in-link error: {err:?}", handler.config.name);
                     None
                 }) {
@@ -1120,7 +1184,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                         link.restart();
                     }
                 } else if link.elapsed() > timer_config.out_link_stale + timer_config.out_link_close {
-                    if let Some(packet) = link.teardown().unwrap_or_else(|err| {
+                    if let Some(packet) = link.teardown(&handler.link_out_event_tx).unwrap_or_else(|err| {
                         log::error!(
                             "tp({}): teardown stale out-link error: {err:?}",
                             handler.config.name
@@ -1141,7 +1205,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                 handler.send_packet(link.request()).await;
             }
             LinkStatus::Closed => {
-                link.close();
+                link.close(&handler.link_out_event_tx);
                 links_to_remove.push(*link_entry.0);
             }
             _ => {}
