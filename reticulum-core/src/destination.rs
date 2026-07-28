@@ -15,6 +15,7 @@ use crate::{
         self, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
         PacketDataBuffer, PacketType, PropagationType,
     },
+    time::unix_time_as_secs,
 };
 use sha2::Digest;
 
@@ -244,7 +245,7 @@ impl Destination<PrivateIdentity, Input, Single> {
         let mut packet_data = PacketDataBuffer::new();
 
         let rand_hash = Hash::new_from_rand(rng);
-        let timestamp = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs().to_be_bytes();
+        let timestamp = unix_time_as_secs().to_be_bytes();
         let rand_hash = [&rand_hash.as_slice()[..RAND_HASH_LENGTH / 2], &timestamp[3..]].concat();
 
         let pub_key = self.identity.as_identity().public_key_bytes();
@@ -369,7 +370,7 @@ pub type SingleOutputDestination = Destination<Identity, Output, Single>;
 pub type PlainInputDestination = Destination<EmptyIdentity, Input, Plain>;
 pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use rand_core::OsRng;
 
@@ -377,6 +378,8 @@ mod tests {
     use crate::hash::Hash;
     use crate::identity::PrivateIdentity;
     use crate::serde::Serialize;
+
+    use std::println;
 
     use super::DestinationAnnounce;
     use super::DestinationName;

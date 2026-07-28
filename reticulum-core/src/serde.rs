@@ -95,7 +95,7 @@ impl Packet {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature="std"))]
 mod tests {
     use rand_core::OsRng;
 
@@ -107,6 +107,8 @@ mod tests {
             PropagationType,
         },
     };
+
+    use std::println;
 
     use super::Serialize;
 

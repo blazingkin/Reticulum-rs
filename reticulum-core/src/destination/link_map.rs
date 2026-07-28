@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use alloc::collections::BTreeMap;
 
 use crate::hash::AddressHash;
 
@@ -6,13 +6,13 @@ use super::link::LinkId;
 
 #[derive(Default)]
 pub struct LinkMap {
-    map: HashMap<AddressHash, LinkId>,
+    map: BTreeMap<AddressHash, LinkId>,
 }
 
 impl LinkMap {
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: BTreeMap::new(),
         }
     }
 

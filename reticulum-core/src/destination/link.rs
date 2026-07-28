@@ -1,7 +1,6 @@
-use std::{
-    cmp::min,
-    time::{Duration, Instant},
-};
+use alloc::{boxed::Box, vec::Vec};
+
+use core::{cmp::min, time::Duration};
 
 use ed25519_dalek::{Signature, SigningKey, Verifier, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use rand_core::OsRng;
@@ -16,6 +15,7 @@ use crate::{
     packet::{
         DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
     },
+    time::now,
 };
 
 use super::DestinationDesc;
@@ -145,7 +145,7 @@ pub struct Link {
     peer_identity: Identity,
     derived_key: DerivedKey,
     status: LinkStatus,
-    request_time: Instant,
+    request_time: Duration,
     rtt: Duration,
     proves_messages: bool,
 }
@@ -159,7 +159,7 @@ impl Link {
             peer_identity: Identity::default(),
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
-            request_time: Instant::now(),
+            request_time: now(),
             rtt: Duration::from_secs(0),
             proves_messages: false,
         }
@@ -193,7 +193,7 @@ impl Link {
             peer_identity,
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
-            request_time: Instant::now(),
+            request_time: now(),
             rtt: Duration::from_secs(0),
             proves_messages: false,
         };
@@ -229,7 +229,7 @@ impl Link {
     }
 
     pub fn touch(&mut self) {
-        self.request_time = Instant::now();
+        self.request_time = now();
     }
 
     pub fn data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
@@ -378,14 +378,14 @@ impl Link {
         log::warn!(
             "link({}): restart after {}s",
             self.id,
-            self.request_time.elapsed().as_secs()
+            self.elapsed().as_secs()
         );
 
         self.status = LinkStatus::Pending;
     }
 
     pub fn elapsed(&self) -> Duration {
-        self.request_time.elapsed()
+        now() - self.request_time
     }
 
     pub fn status(&self) -> LinkStatus {
@@ -487,7 +487,7 @@ impl Link {
                     let mut buffer = [0u8; PACKET_MDU];
                     if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer) {
                         log::trace!("link({}): data over channel {}B", self.id, plain_text.len());
-                        self.request_time = Instant::now();
+                        self.request_time = now();
 
                         channel_tx.send(LinkPayload::new_from_slice(plain_text));
 
@@ -524,7 +524,7 @@ impl Link {
                 self.handshake(identity);
 
                 self.status = LinkStatus::Active;
-                self.rtt = self.request_time.elapsed();
+                self.rtt = self.elapsed();
 
                 log::debug!("link({}): activated", self.id);
 
