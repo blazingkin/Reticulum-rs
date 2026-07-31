@@ -1,6 +1,5 @@
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(feature = "alloc")]
 extern crate alloc;
 
 #[cfg(feature = "std")]
@@ -29,7 +28,7 @@ pub mod time;
 /// first will panic.
 ///
 /// `unix_now`: the current UNIX timestamp in seconds.
-#[allow(unused)]
+#[allow(unused_variables)]
 pub fn init(unix_now: u64) {
     #[cfg(not(feature = "std"))]
     crate::time::init(unix_now);

@@ -135,7 +135,6 @@
 //!     }
 //! # }
 //! ```
-#[cfg(feature = "alloc")]
 extern crate alloc;
 
 pub use reticulum_core::*;

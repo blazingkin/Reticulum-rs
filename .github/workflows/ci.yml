@@ -32,7 +32,9 @@ jobs:
       - name: install build dependencies
         run: apt-get update && apt-get install -y protobuf-compiler
       - name: clippy
-        run: cargo clippy --workspace --all-targets --all-features
+        run: |
+          cargo clippy --workspace --all-targets --all-features
+          cargo clippy -p reticulum-core --no-default-features --features="embassy-time"
 
   test:
     runs-on: ubuntu-latest
@@ -57,4 +59,6 @@ jobs:
       - name: verify Reticulum install
         run: python3 -c "import RNS; print(RNS.__file__)"
       - name: test
-        run: cargo test --workspace --all-targets --features="python-tests" -- --no-capture
+        run: |
+          cargo test --workspace --all-targets --features="python-tests" -- --no-capture
+          cargo test -p reticulum-core --all-targets --no-default-features --features="embassy-time"
