@@ -562,12 +562,12 @@ impl Outbound {
         let transport = match self.transport.upgrade() {
             Some(t) => t,
             None => {
-                return Err(RnsError::ChannelLinkNotReady);
+                return Err(RnsError::LinkNotReady);
             }
         };
 
         if !self.is_ready_to_send().await {
-            return Err(RnsError::ChannelLinkNotReady);
+            return Err(RnsError::LinkNotReady);
         }
 
         let sequence = self.next_sequence;
@@ -1178,7 +1178,7 @@ mod tests {
         assert!(!channel_a.is_ready().await);
 
         let result = channel_a.send(&TestMessage::Short(0)).await;
-        assert_eq!(result, Err(RnsError::ChannelLinkNotReady));
+        assert_eq!(result, Err(RnsError::LinkNotReady));
 
         fixture.link_a.lock().await.status = LinkStatus::Active;
 
@@ -1195,7 +1195,7 @@ mod tests {
         assert!(!channel_a.is_ready().await);
 
         let result = channel_a.send(&TestMessage::Short(3)).await;
-        assert_eq!(result, Err(RnsError::ChannelLinkNotReady));
+        assert_eq!(result, Err(RnsError::LinkNotReady));
     }
 
     #[tokio::test]

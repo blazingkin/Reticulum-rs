@@ -241,9 +241,16 @@ impl Link {
     }
 
     pub fn data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
-        if self.status != LinkStatus::Active && self.status != LinkStatus::Stale {
-            log::warn!("link: can't create data packet for closed link");
-            return Err(RnsError::LinkClosed)
+        match self.status {
+            LinkStatus::Pending | LinkStatus::Handshake => {
+                log::warn!("link: can't create data packet for pending link");
+                return Err(RnsError::LinkNotReady)
+            }
+            LinkStatus::Closed => {
+                log::warn!("link: can't create data packet for closed link");
+                return Err(RnsError::LinkClosed)
+            }
+            LinkStatus::Active | LinkStatus::Stale => {}
         }
 
         let mut packet_data = PacketDataBuffer::new();
@@ -271,9 +278,16 @@ impl Link {
 
     /// Identifies the initiator of the link to the remote peer
     pub fn identify(&self, identity: &PrivateIdentity) -> Result<Packet, RnsError> {
-        if self.status != LinkStatus::Active && self.status != LinkStatus::Stale {
-            log::warn!("link: can't create identity packet for closed link");
-            return Err(RnsError::LinkClosed)
+        match self.status {
+            LinkStatus::Pending | LinkStatus::Handshake => {
+                log::warn!("link: can't create identify packet for pending link");
+                return Err(RnsError::LinkNotReady)
+            }
+            LinkStatus::Closed => {
+                log::warn!("link: can't create identify packet for closed link");
+                return Err(RnsError::LinkClosed)
+            }
+            LinkStatus::Active | LinkStatus::Stale => {}
         }
         let pub_identity = identity.as_identity();
         let signed_data = [

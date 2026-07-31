@@ -8,8 +8,8 @@ pub enum RnsError {
     PacketError,
     ConnectionError,
     LinkClosed,
+    LinkNotReady,
     ChannelError,
-    ChannelLinkNotReady,
     ChannelMessageTooBig,
     ChannelUnknownMessageType,
 }
