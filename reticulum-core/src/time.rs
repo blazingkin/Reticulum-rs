@@ -31,6 +31,19 @@ mod no_std_only {
         Instant::now().duration_since(Instant::from_ticks(0))
     }
 
+    /// Initialize the UNIX time
+    ///
+    /// Reticulum needs to know the current UNIX timestamp in order to create
+    /// announce packets.
+    ///
+    /// On the `std` build, the system clock is used and this function has no
+    /// effect.
+    ///
+    /// On the `no_std` build, it must be called before any destinations are
+    /// created. Creating a destination without having called this function
+    /// first will panic.
+    ///
+    /// `unix_now`: the current UNIX timestamp in seconds.
     pub fn init(unix_now: u64) {
         let boot_unix_time = unix_now - elapsed_since_boot().as_secs();
 
@@ -57,3 +70,5 @@ pub (crate) use std_only::*;
 
 #[cfg(not(feature = "std"))]
 pub (crate) use no_std_only::*;
+#[cfg(not(feature = "std"))]
+pub use no_std_only::init;
