@@ -33,7 +33,8 @@ jobs:
         run: apt-get update && apt-get install -y protobuf-compiler
       - name: clippy
         run: |
-          cargo clippy --workspace --all-targets --all-features
+          cargo clippy --workspace --all-targets
+          cargo clippy -p reticulum --all-targets --all-features
           cargo clippy -p reticulum-core --no-default-features --features="embassy-time"
 
   test:

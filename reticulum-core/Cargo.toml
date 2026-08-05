@@ -22,3 +22,4 @@ x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 default = ["std"]
 fernet-aes128 = []
 std = []
+no_std = ["embassy-time"]
