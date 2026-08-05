@@ -1,4 +1,4 @@
-use alloc::fmt::Write;
+use alloc::{fmt::Write, string::String};
 use hkdf::Hkdf;
 use rand_core::CryptoRngCore;
 
